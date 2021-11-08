@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"reflect"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -44,7 +45,9 @@ type MemcachedReconciler struct {
 //+kubebuilder:rbac:groups=cache.nati.com,resources=memcacheds,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=cache.nati.com,resources=memcacheds/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=cache.nati.com,resources=memcacheds/finalizers,verbs=update
+//+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=apps,resources=daemonsets,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
@@ -76,7 +79,7 @@ func (r *MemcachedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	// Check if the deployment already exists, if not create a new one
-	found := &appsv1.DaemonSet{}
+	found := &appsv1.Deployment{}
 	err = r.Get(ctx, types.NamespacedName{Name: memcached.Name, Namespace: memcached.Namespace}, found)
 	if err != nil && errors.IsNotFound(err) {
 		// Define a new deployment
@@ -95,19 +98,19 @@ func (r *MemcachedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	// Ensure the deployment size is the same as the spec
-	// size := memcached.Spec.Size
-	// if *found.Spec.Replicas != size {
-	// 	found.Spec.Replicas = &size
-	// 	err = r.Update(ctx, found)
-	// 	if err != nil {
-	// 		log.Error(err, "Failed to update Deployment", "Deployment.Namespace", found.Namespace, "Deployment.Name", found.Name)
-	// 		return ctrl.Result{}, err
-	// 	}
-	// 	// Ask to requeue after 1 minute in order to give enough time for the
-	// 	// pods be created on the cluster side and the operand be able
-	// 	// to do the next update step accurately.
-	// 	return ctrl.Result{RequeueAfter: time.Minute}, nil
-	// }
+	size := memcached.Spec.Size
+	if *found.Spec.Replicas != size {
+		found.Spec.Replicas = &size
+		err = r.Update(ctx, found)
+		if err != nil {
+			log.Error(err, "Failed to update Deployment", "Deployment.Namespace", found.Namespace, "Deployment.Name", found.Name)
+			return ctrl.Result{}, err
+		}
+		// Ask to requeue after 1 minute in order to give enough time for the
+		// pods be created on the cluster side and the operand be able
+		// to do the next update step accurately.
+		return ctrl.Result{RequeueAfter: time.Minute}, nil
+	}
 
 	// Update the Memcached status with the pod names
 	// List the pods for this memcached's deployment
@@ -132,13 +135,69 @@ func (r *MemcachedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 	}
 
+	// Check if the deployment already exists, if not create a new one
+	foundService := &corev1.Service{}
+	err = r.Get(ctx, types.NamespacedName{Name: memcached.Name, Namespace: memcached.Namespace}, foundService)
+	if err != nil && errors.IsNotFound(err) {
+		// Define a new deployment
+		serv := r.serviceForMemcached(memcached)
+		log.Info("Creating a new Service", "Service.Namespace", serv.Namespace, "Service.Name", serv.Name)
+		err = r.Create(ctx, serv)
+		if err != nil {
+			log.Error(err, "Failed to create new Service", "Service.Namespace", serv.Namespace, "Service.Name", serv.Name)
+			return ctrl.Result{}, err
+		}
+		// Service created successfully - return and requeue
+		return ctrl.Result{Requeue: true}, nil
+	} else if err != nil {
+		log.Error(err, "Failed to get Deployment")
+		return ctrl.Result{}, err
+	}
+
 	return ctrl.Result{}, nil
 }
 
 // deploymentForMemcached returns a memcached Deployment object
-func (r *MemcachedReconciler) deploymentForMemcached(m *cachev1alpha1.Memcached) *appsv1.DaemonSet {
+func (r *MemcachedReconciler) deploymentForMemcached(m *cachev1alpha1.Memcached) *appsv1.Deployment {
 	ls := labelsForMemcached(m.Name)
-	// replicas := m.Spec.Size
+	replicas := m.Spec.Size
+
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      m.Name,
+			Namespace: m.Namespace,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: ls,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: ls,
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Image:   "memcached:1.4.36-alpine",
+						Name:    "memcached",
+						Command: []string{"memcached", "-m=64", "-o", "modern", "-v"},
+						Ports: []corev1.ContainerPort{{
+							ContainerPort: 11211,
+							Name:          "memcached",
+						}},
+					}},
+				},
+			},
+		},
+	}
+	// Set Memcached instance as the owner and controller
+	ctrl.SetControllerReference(m, dep, r.Scheme)
+	return dep
+}
+
+// daemonsetForMemcached returns a memcached Daemonset object
+func (r *MemcachedReconciler) daemonsetForMemcached(m *cachev1alpha1.Memcached) *appsv1.DaemonSet {
+	ls := labelsForMemcached(m.Name)
 
 	dep := &appsv1.DaemonSet{
 		ObjectMeta: metav1.ObjectMeta{
@@ -170,6 +229,28 @@ func (r *MemcachedReconciler) deploymentForMemcached(m *cachev1alpha1.Memcached)
 	// Set Memcached instance as the owner and controller
 	ctrl.SetControllerReference(m, dep, r.Scheme)
 	return dep
+}
+
+// serviceForMemcached returns a memcached Deployment object
+func (r *MemcachedReconciler) serviceForMemcached(m *cachev1alpha1.Memcached) *corev1.Service {
+	ls := labelsForMemcached(m.Name)
+
+	serv := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      m.Name,
+			Namespace: m.Namespace,
+		},
+		Spec: corev1.ServiceSpec{
+			Type: corev1.ServiceTypeLoadBalancer,
+			Ports: []corev1.ServicePort{{
+				Port: 80,
+			}},
+			Selector: ls,
+		},
+	}
+	// Set Memcached instance as the owner and controller
+	ctrl.SetControllerReference(m, serv, r.Scheme)
+	return serv
 }
 
 // labelsForMemcached returns the labels for selecting the resources

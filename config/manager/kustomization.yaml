@@ -13,4 +13,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: quay.io/nafridma/operator-example-memcached
-  newTag: 0.0.4
+  newTag: 0.0.7
